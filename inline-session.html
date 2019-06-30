@@ -26,27 +26,28 @@ CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
     <meta name='mobile-web-app-capable' content='yes'>
     <meta name='apple-mobile-web-app-capable' content='yes'>
 
-    <title>Reduced Bind Rendering</title>
+    <title>Inline Session</title>
 
     <link href='css/common.css' rel='stylesheet'></link>
   </head>
   <body>
     <header>
       <details open>
-        <summary>Reduced Bind Rendering</summary>
+        <summary>Inline Session</summary>
         <p>
-          This sample demonstrates a simple technique to reduce the number of
-          state changes an application needs to make while rendering, potentially
-          enabling better performance.
+          This sample demonstrates use of an 'inline' XRSession to present
+          content on the page prior to entering XR presentation with an
+          immersive session.
           <a class="back" href="./">Back</a>
         </p>
       </details>
     </header>
     <script type="module">
       import {WebXRButton} from './js/util/webxr-button.js';
-      import {Scene, WebXRView} from './js/render/scenes/scene.js';
+      import {Scene} from './js/render/scenes/scene.js';
       import {Renderer, createWebGLContext} from './js/render/core/renderer.js';
-      import {CubeSeaNode} from './js/render/nodes/cube-sea.js';
+      import {Gltf2Node} from './js/render/nodes/gltf2.js';
+      import {SkyboxNode} from './js/render/nodes/skybox.js';
 
       // XR globals.
       let xrButton = null;
@@ -57,7 +58,9 @@ CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
       let gl = null;
       let renderer = null;
       let scene = new Scene();
-      scene.addNode(new CubeSeaNode());
+      let solarSystem = new Gltf2Node({url: 'media/gltf/space/space.gltf'});
+      scene.addNode(solarSystem);
+      scene.addNode(new SkyboxNode({url: 'media/textures/milky-way-4k.png'}));
 
       function initXR() {
         xrButton = new WebXRButton({
@@ -71,37 +74,17 @@ CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
             xrButton.enabled = true;
           });
 
+          // Start up an inline session, which should always be supported on
+          // browsers that support WebXR regardless of the available hardware.
           navigator.xr.requestSession('inline').then(onSessionStarted);
         }
-      }
-
-      function initGL() {
-        if (gl)
-          return;
-
-        gl = createWebGLContext({
-          xrCompatible: true
-        });
-        document.body.appendChild(gl.canvas);
-
-        function onResize() {
-          gl.canvas.width = gl.canvas.clientWidth * window.devicePixelRatio;
-          gl.canvas.height = gl.canvas.clientHeight * window.devicePixelRatio;
-        }
-        window.addEventListener('resize', onResize);
-        onResize();
-
-        // Set up a non-black clear color so that we can see if something renders wrong.
-        gl.clearColor(0.1, 0.2, 0.3, 1.0);
-
-        renderer = new Renderer(gl);
-
-        scene.setRenderer(renderer);
       }
 
       function onRequestSession() {
         navigator.xr.requestSession('immersive-vr').then((session) => {
           xrButton.setSession(session);
+          // Set a flag on the session so we can differentiate it from the
+          // inline session.
           session.isImmersive = true;
           onSessionStarted(session);
         });
@@ -110,15 +93,48 @@ CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
       function onSessionStarted(session) {
         session.addEventListener('end', onSessionEnded);
 
-        initGL();
+        if (!gl) {
+          gl = createWebGLContext({
+            xrCompatible: true
+          });
 
+          // In order for an inline session to be used we must attach the WebGL
+          // canvas to the document, which will serve as the output surface for
+          // the results of the inline session's rendering.
+          document.body.appendChild(gl.canvas);
+          
+          // The canvas is synced with the window size via CSS, but we still
+          // need to update the width and height attributes in order to keep
+          // the default framebuffer resolution in-sync.
+          function onResize() {
+            gl.canvas.width = gl.canvas.clientWidth * window.devicePixelRatio;
+            gl.canvas.height = gl.canvas.clientHeight * window.devicePixelRatio;
+          }
+          window.addEventListener('resize', onResize);
+          onResize();
+
+          renderer = new Renderer(gl);
+
+          scene.setRenderer(renderer);
+        }
+        
+        // WebGL layers for inline sessions must set the compositionDisabled
+        // option to true, which stops it from allocating it's own framebuffer
+        // and causes gl commands to naturally execute against the default
+        // framebuffer, while still using the canvas dimensions to compute
+        // viewports and projection matrices.
         let glLayer = new XRWebGLLayer(session, gl, {
           compositionDisabled: !session.isImmersive
         });
-        session.updateRenderState({ baseLayer: glLayer });
+
+        session.updateRenderState({
+          baseLayer: glLayer
+        });
 
         let refSpaceType = session.isImmersive ? 'local' : 'viewer';
         session.requestReferenceSpace(refSpaceType).then((refSpace) => {
+          // Since we're dealing with multiple sessions now we need to track
+          // which XRReferenceSpace is associated with which XRSession.
           if (session.isImmersive) {
             xrImmersiveRefSpace = refSpace;
           } else {
@@ -133,13 +149,16 @@ CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
       }
 
       function onSessionEnded(event) {
+        // Only reset the button when the immersive session ends.
         if (event.session.isImmersive) {
           xrButton.setSession(null);
         }
       }
 
+      // Called every time a XRSession requests that a new frame be drawn.
       function onXRFrame(t, frame) {
         let session = frame.session;
+        // Ensure that we're using the right frame of reference for the session.
         let refSpace = session.isImmersive ?
                          xrImmersiveRefSpace :
                          xrNonImmersiveRefSpace;
@@ -152,71 +171,20 @@ CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
         if (pose) {
           let glLayer = session.renderState.baseLayer;
           gl.bindFramebuffer(gl.FRAMEBUFFER, glLayer.framebuffer);
-          gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
 
-          // This is a different rendering pattern than the previous samples
-          // used, but it should be more efficent. It's very common for apps
-          // being ported to XR to take existing 2D rendering code and call the
-          // top-level "drawScene" function once per XR view, effectively
-          // drawing a single eye at a time. However, this causes many state
-          // changes to be duplicated, which adds to the render loop's overhead.
-          // By providing the matrices and viewports as an array to the drawing
-          // function it can do all the necessary binding once and then call the
-          // actual draw commands in a tighter loop, only changing the matrices
-          // and viewport each time. This does mean that the viewport is changed
-          // much more frequently (N times per object instead of N times per
-          // scene) but it's typically a pretty cheap thing to change and will
-          // almost always be easily outweighed by the savings from not
-          // redundantly binding everything else.
-
-          // For example, a traditional draw loop would do this:
-
-          // Draw(views):
-          //   for each view in views:
-          //     setViewport();
-          //     for each object in scene:
-          //       bindProgram();
-          //       bindMatrices();
-          //       bindUniforms();
-          //       bindBuffers();
-          //       bindTextures();
-          //       draw();
-
-          // While this method results in a loop more like this:
-
-          // Draw(views):
-          //   for each object in scene:
-          //     bindProgram();  
-          //     bindUniforms();
-          //     bindBuffers();
-          //     bindTextures();
-          //     for each view in views:
-          //       setViewport();
-          //       bindMatrices();
-          //       draw();
-
-          // Note that for the complexity of the scene in this samples this
-          // won't make much visible performance difference, but we're using the
-          // more efficient pattern anyway as a way of promoting best practices.
-
-          let views = [];
           for (let view of pose.views) {
-            // Gather all the values needed for one view and push it into the
-            // array of views to be drawn. WebXRView is a utility class that
-            // holds all the necessary values for drawing a single view.
+            let viewport = glLayer.getViewport(view);
+            gl.viewport(viewport.x, viewport.y,
+                        viewport.width, viewport.height);
 
-            // In future samples we'll hide this part away as well by using the
-            // scene.drawXRViews() function, which handles gathering these
-            // values internally.
-            views.push(new WebXRView(view, glLayer));
+            scene.draw(view.projectionMatrix, view.transform);
           }
-
-          scene.drawViewArray(views);
         }
 
         scene.endFrame();
       }
 
+      // Start the XR application.
       initXR();
     </script>
   </body>
